@@ -7,7 +7,7 @@ app = Flask(__name__)
 @app.route("/extract", methods=["POST"])
 def extract_images():
     if 'file' not in request.files:
-    return jsonify({"error": "No file uploaded"}), 400
+        return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files['file']
     temp_dir = tempfile.mkdtemp()
