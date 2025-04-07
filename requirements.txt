@@ -1,3 +1,3 @@
-flask
-openpyxl
-gunicorn
+Flask==2.2.5
+openpyxl==3.1.2
+gunicorn==23.0.0
