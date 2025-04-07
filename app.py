@@ -1,5 +1,9 @@
 from flask import Flask, request, jsonify
-import os, zipfile, tempfile, shutil, base64
+import os
+import zipfile
+import tempfile
+import shutil
+import xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 
 app = Flask(__name__)
@@ -10,13 +14,14 @@ def extract_images():
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files['file']
+
     temp_dir = tempfile.mkdtemp()
     xlsx_path = os.path.join(temp_dir, "file.xlsx")
     file.save(xlsx_path)
 
-    # 解壓縮 xlsx 檔
     unzip_path = os.path.join(temp_dir, "unzipped")
     os.makedirs(unzip_path, exist_ok=True)
+
     with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
         zip_ref.extractall(unzip_path)
 
@@ -24,43 +29,54 @@ def extract_images():
     wb = load_workbook(xlsx_path)
     ws = wb.active
 
-    # 建立 row -> F欄資料 的對照
+    # 解析圖片儲存格對應資料
+    drawing_path = os.path.join(unzip_path, "xl", "drawings", "drawing1.xml")
+    if not os.path.exists(drawing_path):
+        return jsonify({"error": "drawing1.xml not found"}), 500
+
+    tree = ET.parse(drawing_path)
+    root = tree.getroot()
+
+    ns = {
+        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+        'xdr': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
+    }
+
+    image_cells = []
+    for anchor in root.findall("xdr:twoCellAnchor", ns):
+        from_node = anchor.find("xdr:from", ns)
+        row = int(from_node.find("xdr:row", ns).text)
+        col = int(from_node.find("xdr:col", ns).text)
+        image_cells.append((row, col))
+
+    # 讀取第 row+1 列、第 F 欄 (index = 5) 作為圖片檔名依據
     name_map = {}
-    for row in ws.iter_rows(min_row=6):
-        row_index = row[0].row
-        name = row[5].value  # F欄是 index 5
-        if name:
-            name_map[row_index] = str(name).strip()
+    for row, col in image_cells:
+        excel_row = row + 1  # zero-based to 1-based row number
+        cell_value = ws.cell(row=excel_row, column=6).value  # F欄 = 第6欄
+        name_map[row] = str(cell_value).strip() if cell_value else "unknown"
 
-    # 取得圖片插入的列位置
-    image_row_map = {}
-    for i, img in enumerate(ws._images):
-        try:
-            anchor = img.anchor._from
-            row = anchor.row + 1  # openpyxl row 從 0 起算
-            image_row_map[i] = row
-            print(f"📸 圖片 {i} 貼在第 {row} 列")
-        except Exception as e:
-            print(f"⚠️ 圖片 {i} 無法取得位置：{e}")
-
-    # 處理圖片檔案
+    # 搬圖片
     media_path = os.path.join(unzip_path, "xl", "media")
+    output_path = os.path.join(temp_dir, "output")
+    os.makedirs(output_path, exist_ok=True)
+
     result = []
     if os.path.exists(media_path):
         images = sorted(os.listdir(media_path))
         for i, img_name in enumerate(images):
-            row = image_row_map.get(i, i + 6)  # 如果無法定位，就假設是第 6+i 列
-            filename = f"{name_map.get(row, 'unknown')}.jpeg"
-            image_path = os.path.join(media_path, img_name)
+            # 如果圖片數量比儲存格還多，會抓不到對應 row
+            if i < len(image_cells):
+                row, _ = image_cells[i]
+                new_name = f"{name_map.get(row, 'unknown')}.jpeg"
+            else:
+                new_name = f"unknown_{i}.jpeg"
 
-            with open(image_path, "rb") as f:
-                encoded = base64.b64encode(f.read()).decode("utf-8")
-
-            result.append({
-                "filename": filename,
-                "content": encoded,
-                "mime_type": "image/jpeg"
-            })
+            shutil.copyfile(
+                os.path.join(media_path, img_name),
+                os.path.join(output_path, new_name)
+            )
+            result.append({"filename": new_name})
 
     shutil.rmtree(temp_dir)
     return jsonify({"images": result})
