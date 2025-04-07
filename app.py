@@ -54,12 +54,14 @@ def extract_images():
         tree = ET.parse(drawing_path)
         ns = {'xdr': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'}
         for one in tree.findall(".//xdr:twoCellAnchor", ns):
-            from_row = int(one.find("xdr:from/xdr:row", ns).text) + 1
+            from_row_elem = one.find("xdr:from/xdr:row", ns)
             blip = one.find(".//xdr:blip", ns)
-            if blip is not None:
+            if from_row_elem is not None and blip is not None:
+                from_row = int(from_row_elem.text) + 1
                 r_embed = blip.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed']
                 img_name = rels_map.get(r_embed)
                 if img_name:
+                    print(f"drawing cell row {from_row} → {img_name}")
                     img_order.append((from_row, img_name))
 
     # 建立 output
@@ -75,6 +77,8 @@ def extract_images():
                 "content": encoded_string,
                 "mime_type": "image/jpeg"
             })
+        else:
+            print(f"⚠️ 找不到圖片: {img_path}")
 
     shutil.rmtree(temp_dir)
     return jsonify({"images": output_images})
