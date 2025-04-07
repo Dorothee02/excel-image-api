@@ -6,11 +6,10 @@ app = Flask(__name__)
 
 @app.route("/extract", methods=["POST"])
 def extract_images():
-    print("收到的檔案欄位有哪些：", request.files)
-    if 'data' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+    if 'file' not in request.files:
+    return jsonify({"error": "No file uploaded"}), 400
 
-    file = request.files['data']
+    file = request.files['file']
     temp_dir = tempfile.mkdtemp()
     xlsx_path = os.path.join(temp_dir, "file.xlsx")
     file.save(xlsx_path)
