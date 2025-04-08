@@ -1,42 +1,51 @@
 from flask import Flask, request, jsonify
-import os, zipfile, tempfile, shutil, base64, re
+import os, zipfile, tempfile, shutil, base64
 from openpyxl import load_workbook
+import re
 
 app = Flask(__name__)
 
-def natural_sort_key(s):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
-
 @app.route("/extract", methods=["POST"])
 def extract_images():
+    # 檢查是否有收到名為 'file' 的檔案
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files['file']
+
+    # 建立暫存資料夾並儲存檔案
     temp_dir = tempfile.mkdtemp()
     xlsx_path = os.path.join(temp_dir, "file.xlsx")
     file.save(xlsx_path)
 
+    # 解壓縮 Excel 檔案
     unzip_path = os.path.join(temp_dir, "unzipped")
     os.makedirs(unzip_path, exist_ok=True)
     with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
         zip_ref.extractall(unzip_path)
 
+    # 讀取第 6 列開始的 F 欄（index 5）作為商品編號
     wb = load_workbook(xlsx_path)
     ws = wb.active
+    product_ids = []
+    for row in ws.iter_rows(min_row=6):
+        product_ids.append(str(row[5].value).strip() if row[5].value else "unknown")
 
+    # 取得圖片檔案路徑
     media_path = os.path.join(unzip_path, "xl", "media")
     output_images = []
+
     if os.path.exists(media_path):
-        images = sorted(os.listdir(media_path), key=natural_sort_key)
-        image_count = len(images)
+        images = os.listdir(media_path)
 
-        # 讀取第 6 列開始、F 欄的值，抓到跟圖片一樣多的資料
-        product_ids = []
-        for i in range(image_count):
-            cell_value = ws.cell(row=6 + i, column=6).value  # column=6 是 F 欄
-            product_ids.append(str(cell_value).strip() if cell_value else "unknown")
+        # 依照圖片檔名中的數字做排序（避免 image10 在 image2 前面）
+        def extract_number(filename):
+            match = re.search(r'(\\d+)', filename)
+            return int(match.group(1)) if match else 0
 
+        images = sorted(images, key=extract_number)
+
+        # 對應圖片與商品編號並回傳 base64 資料
         for i, img_name in enumerate(images):
             img_path = os.path.join(media_path, img_name)
             with open(img_path, "rb") as f:
@@ -48,7 +57,9 @@ def extract_images():
                 "mime_type": "image/jpeg"
             })
 
+    # 清理暫存資料夾
     shutil.rmtree(temp_dir)
+
     return jsonify({"images": output_images})
 
 if __name__ == "__main__":
