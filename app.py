@@ -35,14 +35,14 @@ def extract_images():
     media_path = os.path.join(unzip_path, "xl", "media")
     output_images = []
 
+    # 解析圖片檔名中的數字順序
+    def extract_number(filename):
+        match = re.search(r'(\d+)', filename)
+        return int(match.group(1)) if match else 0
+
     if os.path.exists(media_path):
-        images = os.listdir(media_path)
-
-        # 依照圖片檔名中的數字做排序（避免 image10 在 image2 前面）
-        def extract_number(filename):
-            match = re.search(r'(\\d+)', filename)
-            return int(match.group(1)) if match else 0
-
+        # 處理所有 jpeg/jpg/png 格式的圖
+        images = [img for img in os.listdir(media_path) if img.lower().endswith((".jpeg", ".jpg", ".png"))]
         images = sorted(images, key=extract_number)
 
         # 對應圖片與商品編號並回傳 base64 資料
