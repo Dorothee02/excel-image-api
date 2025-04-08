@@ -30,7 +30,7 @@ def extract_images():
     media_path = os.path.join(unzip_path, "xl", "media")
     output_images = []
     if os.path.exists(media_path):
-        images = sorted(os.listdir(media_path))  # 順序對應
+        images = sorted(os.listdir(media_path), key=lambda x: int(''.join(filter(str.isdigit, x))))
         for i, img_name in enumerate(images):
             img_path = os.path.join(media_path, img_name)
             with open(img_path, "rb") as f:
