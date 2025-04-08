@@ -1,8 +1,11 @@
 from flask import Flask, request, jsonify
-import os, zipfile, tempfile, shutil, base64
+import os, zipfile, tempfile, shutil, base64, re
 from openpyxl import load_workbook
 
 app = Flask(__name__)
+
+def natural_sort_key(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
 @app.route("/extract", methods=["POST"])
 def extract_images():
@@ -19,18 +22,21 @@ def extract_images():
     with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
         zip_ref.extractall(unzip_path)
 
-    # 讀取第 6 列開始的 F 欄（index 5）作為圖片檔名
     wb = load_workbook(xlsx_path)
     ws = wb.active
-    product_ids = []
-    for row in ws.iter_rows(min_row=6):
-        product_ids.append(str(row[5].value).strip() if row[5].value else "unknown")
 
-    # 處理 media 裡的圖片
     media_path = os.path.join(unzip_path, "xl", "media")
     output_images = []
     if os.path.exists(media_path):
-        images = sorted(os.listdir(media_path), key=lambda x: int(''.join(filter(str.isdigit, x))))
+        images = sorted(os.listdir(media_path), key=natural_sort_key)
+        image_count = len(images)
+
+        # 讀取第 6 列開始、F 欄的值，抓到跟圖片一樣多的資料
+        product_ids = []
+        for i in range(image_count):
+            cell_value = ws.cell(row=6 + i, column=6).value  # column=6 是 F 欄
+            product_ids.append(str(cell_value).strip() if cell_value else "unknown")
+
         for i, img_name in enumerate(images):
             img_path = os.path.join(media_path, img_name)
             with open(img_path, "rb") as f:
