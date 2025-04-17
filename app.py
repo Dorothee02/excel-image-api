@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import os, zipfile, tempfile, shutil, base64
+import os, zipfile, tempfile, shutil, base64, xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 import re
 
@@ -7,59 +7,98 @@ app = Flask(__name__)
 
 @app.route("/extract", methods=["POST"])
 def extract_images():
-    # 檢查是否有收到名為 'file' 的檔案
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files['file']
-
-    # 建立暫存資料夾並儲存檔案
     temp_dir = tempfile.mkdtemp()
     xlsx_path = os.path.join(temp_dir, "file.xlsx")
     file.save(xlsx_path)
 
-    # 解壓縮 Excel 檔案
+    # 解壓縮 Excel
     unzip_path = os.path.join(temp_dir, "unzipped")
     os.makedirs(unzip_path, exist_ok=True)
     with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
         zip_ref.extractall(unzip_path)
 
-    # 讀取第 6 列開始的 F 欄（index 5）作為商品編號
-    wb = load_workbook(xlsx_path)
+    # 讀取 Excel 表格
+    wb = load_workbook(xlsx_path, data_only=True)
     ws = wb.active
-    product_ids = []
-    for row in ws.iter_rows(min_row=6):
-        product_ids.append(str(row[5].value).strip() if row[5].value else "unknown")
 
-    # 取得圖片檔案路徑
+    # 尋找欄位名稱中含 JAN / ＪＡＮ 的欄位索引
+    header_row = None
+    jan_col_index = None
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10)):
+        for j, cell in enumerate(row):
+            if cell.value and isinstance(cell.value, str) and ("JAN" in cell.value.upper()):
+                header_row = i + 1
+                jan_col_index = j
+                break
+        if jan_col_index is not None:
+            break
+
+    if jan_col_index is None:
+        return jsonify({"error": "找不到 JAN 或 ＪＡＮ 欄位"}), 400
+
+    # 讀取圖片插入位置
+    drawing_xml = os.path.join(unzip_path, "xl", "drawings", "drawing1.xml")
+    rels_xml = os.path.join(unzip_path, "xl", "drawings", "_rels", "drawing1.xml.rels")
     media_path = os.path.join(unzip_path, "xl", "media")
+
+    if not os.path.exists(drawing_xml):
+        return jsonify({"error": "No drawing1.xml found"}), 400
+
+    # 解析 rels 對應圖片檔名
+    rels_map = {}
+    if os.path.exists(rels_xml):
+        rels_tree = ET.parse(rels_xml)
+        for rel in rels_tree.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
+            rId = rel.attrib['Id']
+            target = rel.attrib['Target'].split('/')[-1]
+            rels_map[rId] = target
+
+    # 取得圖片插入的 row index 與對應 rId
+    image_info = []
+    tree = ET.parse(drawing_xml)
+    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
+    for anchor in tree.findall(".//a:twoCellAnchor", ns):
+        from_tag = anchor.find("a:from", ns)
+        if from_tag is not None:
+            row = int(from_tag.find("a:row", ns).text)
+            pic = anchor.find("a:pic", ns)
+            if pic is not None:
+                blip = pic.find(".//a:blip", {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"})
+                if blip is not None:
+                    embed = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+                    filename = rels_map.get(embed)
+                    image_info.append({"row": row, "filename": filename})
+
+    # 依 row 排序圖片位置
+    image_info = sorted(image_info, key=lambda x: x["row"])
+
+    # 匯出圖片 + 命名（對應該 row 的 jan_col）
     output_images = []
+    for info in image_info:
+        row_idx = info["row"] + 1  # openpyxl 是從 1 開始
+        img_file = info["filename"]
+        full_img_path = os.path.join(media_path, img_file)
+        if not os.path.exists(full_img_path):
+            continue
 
-    # 解析圖片檔名中的數字順序
-    def extract_number(filename):
-        match = re.search(r'(\d+)', filename)
-        return int(match.group(1)) if match else 0
+        # 嘗試讀取該 row 的 jan 值
+        jan_cell = ws.cell(row=row_idx + 1, column=jan_col_index + 1)
+        jan_value = str(jan_cell.value).strip() if jan_cell.value else f"row{row_idx}"
 
-    if os.path.exists(media_path):
-        # 處理所有 jpeg/jpg/png 格式的圖
-        images = [img for img in os.listdir(media_path) if img.lower().endswith((".jpeg", ".jpg", ".png"))]
-        images = sorted(images, key=extract_number)
+        with open(full_img_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
 
-        # 對應圖片與商品編號並回傳 base64 資料
-        for i, img_name in enumerate(images):
-            img_path = os.path.join(media_path, img_name)
-            with open(img_path, "rb") as f:
-                encoded = base64.b64encode(f.read()).decode("utf-8")
-            filename = f"{product_ids[i]}.jpeg" if i < len(product_ids) else f"unknown_{i}.jpeg"
-            output_images.append({
-                "filename": filename,
-                "content": encoded,
-                "mime_type": "image/jpeg"
-            })
+        output_images.append({
+            "filename": f"{jan_value}.jpeg",
+            "content": encoded,
+            "mime_type": "image/jpeg"
+        })
 
-    # 清理暫存資料夾
     shutil.rmtree(temp_dir)
-
     return jsonify({"images": output_images})
 
 if __name__ == "__main__":
