@@ -1,12 +1,11 @@
-
 from flask import Flask, request, jsonify
 import os, zipfile, tempfile, shutil, base64, xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 
 app = Flask(__name__)
 
-EMU_PER_CELL = 9525 * 65  # 每欄約 65pt = 1 格寬
-EMU_PER_ROW = 9525 * 20   # 每列約 20pt = 1 格高
+EMU_PER_CELL = 9525 * 65
+EMU_PER_ROW = 9525 * 20
 
 def calculate_cell_coverage(from_col, from_col_off, to_col, to_col_off,
                              from_row, from_row_off, to_row, to_row_off):
@@ -31,15 +30,15 @@ def calculate_cell_coverage(from_col, from_col_off, to_col, to_col_off,
                 coverage_map[(row, col)] = overlap_area
 
     if not coverage_map:
-        return None, 0.0
+        return None, 0.0, {}
 
     dominant_cell = max(coverage_map, key=coverage_map.get)
     dominant_ratio = coverage_map[dominant_cell] / total_area
 
     if dominant_ratio >= 0.6:
-        return dominant_cell, dominant_ratio
+        return dominant_cell, dominant_ratio, coverage_map
     else:
-        return None, dominant_ratio
+        return None, dominant_ratio, coverage_map
 
 @app.route("/extract", methods=["POST"])
 def extract_images():
@@ -104,7 +103,7 @@ def extract_images():
         to_row = int(to_tag.find("a:row", ns).text)
         to_row_off = int(to_tag.find("a:rowOff", ns).text)
 
-        dominant_cell, ratio = calculate_cell_coverage(
+        dominant_cell, ratio, coverage_map = calculate_cell_coverage(
             from_col, from_col_off, to_col, to_col_off,
             from_row, from_row_off, to_row, to_row_off
         )
@@ -141,12 +140,16 @@ def extract_images():
         debug_log.append({
             "image": img_file,
             "dominant_cell": dominant_cell,
-            "assigned_name": jan_value,
-            "coverage_ratio": round(ratio, 3)
+            "coverage_ratio": round(ratio, 3),
+            "cell_coverages": {str(k): round(v, 3) for k, v in coverage_map.items()},
+            "assigned_name": jan_value
         })
 
     shutil.rmtree(temp_dir)
-    return jsonify({"images": output_images, "debug": debug_log})
+    return jsonify({
+        "images": output_images,
+        "debug": debug_log
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
