@@ -1,129 +1,108 @@
 from flask import Flask, request, jsonify
-import os, zipfile, tempfile, shutil, base64, xml.etree.ElementTree as ET
-from openpyxl import load_workbook
+import zipfile
+import xml.etree.ElementTree as ET
+from io import BytesIO
+import openpyxl
+import os
 
 app = Flask(__name__)
 
-EMU_PER_CELL = 9525 * 65
-EMU_PER_ROW = 9525 * 20
+# XML namespaces
+NAMESPACE_DEFS = {
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "r":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "a":   "http://schemas.openxmlformats.org/drawingml/2006/main"
+}
 
-def get_center_cell(from_col, from_col_off, to_col, to_col_off,
-                     from_row, from_row_off, to_row, to_row_off):
-    center_x = (from_col + from_col_off / EMU_PER_CELL + to_col + to_col_off / EMU_PER_CELL) / 2
-    center_y = (from_row + from_row_off / EMU_PER_ROW + to_row + to_row_off / EMU_PER_ROW) / 2
-    return int(center_y), int(center_x)
+# 1. 取得特定工作表的 drawing XML 檔路徑列表
+def get_sheet_drawing_paths(zf, sheet_idx=1):
+    rels_path = f"xl/worksheets/_rels/sheet{sheet_idx}.xml.rels"
+    if rels_path not in zf.namelist():
+        return []
+    tree = ET.fromstring(zf.read(rels_path))
+    drawing_files = []
+    for rel in tree.findall("Relationship", {"": ""}):
+        if rel.attrib.get("Type", "").endswith("/drawing"):
+            target = rel.attrib["Target"]  # e.g., '../drawings/drawing1.xml'
+            path = os.path.normpath("xl/" + target.replace("../", ""))
+            drawing_files.append(path)
+    return drawing_files
 
-@app.route("/extract", methods=["POST"])
-def extract_images():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+# 2. 解析指定工作表的圖片 anchor（row, col, rId）
+def parse_sheet_anchors(xlsx_bytes, sheet_idx=1):
+    zf = zipfile.ZipFile(BytesIO(xlsx_bytes))
+    drawing_paths = get_sheet_drawing_paths(zf, sheet_idx)
+    anchors = []
+    for dr in drawing_paths:
+        xml = zf.read(dr)
+        tree = ET.fromstring(xml)
+        for tag in ("oneCellAnchor", "twoCellAnchor"):
+            for anc in tree.findall(f"xdr:{tag}", NAMESPACE_DEFS):
+                frm = anc.find("xdr:from", NAMESPACE_DEFS)
+                row = int(frm.find("xdr:row", NAMESPACE_DEFS).text) + 1
+                col = int(frm.find("xdr:col", NAMESPACE_DEFS).text) + 1
+                blip = anc.find(".//a:blip", NAMESPACE_DEFS)
+                if blip is not None:
+                    rId = blip.attrib[f"{{{NAMESPACE_DEFS['r']}}}embed"]
+                    anchors.append((row, col, rId))
+    return anchors, zf
 
-    file = request.files['file']
-    temp_dir = tempfile.mkdtemp()
-    xlsx_path = os.path.join(temp_dir, "file.xlsx")
-    file.save(xlsx_path)
+# 3. 建立 rId -> media 路徑映射
+def build_media_map(zf):
+    media = {}
+    for name in zf.namelist():
+        if name.startswith("xl/drawings/_rels/") and name.endswith(".rels"):
+            tree = ET.fromstring(zf.read(name))
+            drawing_path = name.replace("/_rels/", "/").replace(".rels", "")
+            base_dir = os.path.dirname(drawing_path)
+            for rel in tree.findall("Relationship"):
+                rId = rel.attrib["Id"]
+                target = rel.attrib["Target"]  # e.g., '../media/image1.png'
+                media_path = os.path.normpath(os.path.join(base_dir, target))
+                media[rId] = media_path
+    return media
 
-    unzip_path = os.path.join(temp_dir, "unzipped")
-    os.makedirs(unzip_path, exist_ok=True)
-    with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
-        zip_ref.extractall(unzip_path)
-
-    wb = load_workbook(xlsx_path, data_only=True)
+# 4. 讀取試算表，建立 row -> JAN code 映射
+def load_jan_map(xlsx_bytes, jan_keyword="JAN"):
+    wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), data_only=True)
     ws = wb.active
-
-    jan_col_index = None
-    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10)):
-        for j, cell in enumerate(row):
-            if cell.value and isinstance(cell.value, str) and ("JAN" in cell.value.upper()):
-                jan_col_index = j
+    jan_col = None
+    header_row = None
+    for r in range(1, 11):
+        values = [cell.value for cell in ws[r]]
+        for idx, val in enumerate(values, start=1):
+            if val and jan_keyword.lower() in str(val).strip().lower():
+                jan_col = idx
+                header_row = r
                 break
-        if jan_col_index is not None:
+        if jan_col:
             break
-    if jan_col_index is None:
-        return jsonify({"error": "找不到 JAN 欄位"}), 400
+    if not jan_col:
+        raise ValueError("找不到包含 JAN 的欄位")
+    jan_map = {}
+    for row in range(header_row + 1, ws.max_row + 1):
+        code = ws.cell(row=row, column=jan_col).value
+        if code:
+            jan_map[row] = str(code)
+    return jan_map
 
-    drawing_xml = os.path.join(unzip_path, "xl", "drawings", "drawing1.xml")
-    rels_xml = os.path.join(unzip_path, "xl", "drawings", "_rels", "drawing1.xml.rels")
-    media_path = os.path.join(unzip_path, "xl", "media")
-    rels_map = {}
-
-    if os.path.exists(rels_xml):
-        rels_tree = ET.parse(rels_xml)
-        for rel in rels_tree.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
-            rId = rel.attrib['Id']
-            target = rel.attrib['Target'].split('/')[-1]
-            rels_map[rId] = target
-
-    tree = ET.parse(drawing_xml)
-    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
-    output_images = []
-    debug_log = []
-    unknown_count = 1
-
-    for anchor in tree.findall(".//a:twoCellAnchor", ns):
-        from_tag = anchor.find("a:from", ns)
-        to_tag = anchor.find("a:to", ns)
-        if from_tag is None or to_tag is None:
-            continue
-
-        from_col = int(from_tag.find("a:col", ns).text)
-        from_col_off = int(from_tag.find("a:colOff", ns).text)
-        from_row = int(from_tag.find("a:row", ns).text)
-        from_row_off = int(from_tag.find("a:rowOff", ns).text)
-
-        to_col = int(to_tag.find("a:col", ns).text)
-        to_col_off = int(to_tag.find("a:colOff", ns).text)
-        to_row = int(to_tag.find("a:row", ns).text)
-        to_row_off = int(to_tag.find("a:rowOff", ns).text)
-
-        center_row, center_col = get_center_cell(
-            from_col, from_col_off, to_col, to_col_off,
-            from_row, from_row_off, to_row, to_row_off
-        )
-
-        pic = anchor.find("a:pic", ns)
-        if pic is None:
-            continue
-        blip = pic.find(".//a:blip", {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"})
-        if blip is None:
-            continue
-        embed = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-        img_file = rels_map.get(embed)
-        full_img_path = os.path.join(media_path, img_file)
-        if not os.path.exists(full_img_path):
-            continue
-
-        jan_value = f"unknown_{unknown_count}"
-        if center_row is not None:
-            row_idx = center_row + 1
-            jan_cell = ws.cell(row=row_idx, column=jan_col_index + 1)
-            if jan_cell.value:
-                jan_value = str(jan_cell.value).strip()
-            else:
-                jan_value = f"row{row_idx}"
-        else:
-            unknown_count += 1
-
-        with open(full_img_path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("utf-8")
-
-        output_images.append({
-            "filename": f"{jan_value}.jpeg",
-            "content": encoded,
-            "mime_type": "image/jpeg"
-        })
-
-        debug_log.append({
-            "image": img_file,
-            "center_row_col": (center_row, center_col),
-            "assigned_name": jan_value
-        })
-
-    shutil.rmtree(temp_dir)
-    return jsonify({
-        "images": output_images,
-        "debug": debug_log
-    })
+# HTTP 接口：接收 XLSX，回傳解析結果
+@app.route("/extract-images", methods=["POST"])
+def extract_images():
+    f = request.files.get("file")
+    if not f or not f.filename.endswith(".xlsx"):
+        return "請上傳 .xlsx 檔案", 400
+    data = f.read()
+    anchors, zf = parse_sheet_anchors(data)
+    jan_map = load_jan_map(data)
+    media_map = build_media_map(zf)
+    result = {}
+    for row, col, rId in anchors:
+        jan = jan_map.get(row) or f"unknown_{row}"
+        img_path = media_map.get(rId)
+        if img_path and img_path in zf.namelist():
+            result[jan] = zf.read(img_path)
+    return jsonify({"extracted": list(result.keys())})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
