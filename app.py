@@ -23,7 +23,7 @@ def get_sheet_drawing_paths(zf, sheet_idx=1):
     drawing_files = []
     for rel in tree.findall("Relationship", {"": ""}):
         if rel.attrib.get("Type", "").endswith("/drawing"):
-            target = rel.attrib["Target"]  # e.g., '../drawings/drawing1.xml'
+            target = rel.attrib["Target"]
             path = os.path.normpath("xl/" + target.replace("../", ""))
             drawing_files.append(path)
     return drawing_files
@@ -36,11 +36,9 @@ def parse_sheet_anchors(xlsx_bytes, sheet_idx=1):
     for dr in drawing_paths:
         xml = zf.read(dr)
         tree = ET.fromstring(xml)
-        # 支援 oneCellAnchor, twoCellAnchor, absoluteAnchor
         for tag in ("oneCellAnchor", "twoCellAnchor", "absoluteAnchor"):
             for anc in tree.findall(f"xdr:{tag}", NAMESPACE_DEFS):
                 frm = anc.find("xdr:from", NAMESPACE_DEFS)
-                # 如果沒有 from，跳過
                 if frm is None:
                     continue
                 row = int(frm.find("xdr:row", NAMESPACE_DEFS).text) + 1
@@ -105,13 +103,17 @@ def extract_images():
     jan_map = load_jan_map(data)
     media_map = build_media_map(zf)
 
-    result = []
+    # 建立最終檔名清單，保留原檔副檔名
+    extracted_files = []
     for row, col, rId in anchors:
         jan = jan_map.get(row) or f"unknown_{row}"
-        if rId in media_map and media_map[rId] in zf.namelist():
-            result.append(jan)
-    app.logger.info(f"Extracted JAN codes: {result}")
-    return jsonify({"extracted": result})
+        img_path = media_map.get(rId)
+        if img_path and img_path in zf.namelist():
+            ext = os.path.splitext(img_path)[1]  # 副檔名，例如 .png/.jpg
+            filename = f"{jan}{ext}"
+            extracted_files.append(filename)
+    app.logger.info(f"Extracted files: {extracted_files}")
+    return jsonify({"extracted": extracted_files})
 
 # alias route for convenience
 @app.route("/extract", methods=["POST"])
