@@ -7,38 +7,11 @@ app = Flask(__name__)
 EMU_PER_CELL = 9525 * 65
 EMU_PER_ROW = 9525 * 20
 
-def calculate_cell_coverage(from_col, from_col_off, to_col, to_col_off,
-                             from_row, from_row_off, to_row, to_row_off):
-    x1 = from_col + from_col_off / EMU_PER_CELL
-    x2 = to_col + to_col_off / EMU_PER_CELL
-    y1 = from_row + from_row_off / EMU_PER_ROW
-    y2 = to_row + to_row_off / EMU_PER_ROW
-
-    total_area = (x2 - x1) * (y2 - y1)
-    coverage_map = {}
-
-    for col in range(int(x1), int(x2) + 1):
-        for row in range(int(y1), int(y2) + 1):
-            cell_x1, cell_x2 = col, col + 1
-            cell_y1, cell_y2 = row, row + 1
-
-            overlap_x = max(0, min(x2, cell_x2) - max(x1, cell_x1))
-            overlap_y = max(0, min(y2, cell_y2) - max(y1, cell_y1))
-            overlap_area = overlap_x * overlap_y
-
-            if overlap_area > 0:
-                coverage_map[(row, col)] = overlap_area
-
-    if not coverage_map:
-        return None, 0.0, {}
-
-    dominant_cell = max(coverage_map, key=coverage_map.get)
-    dominant_ratio = coverage_map[dominant_cell] / total_area
-
-    if dominant_ratio >= 0.6:
-        return dominant_cell, dominant_ratio, coverage_map
-    else:
-        return None, dominant_ratio, coverage_map
+def get_center_cell(from_col, from_col_off, to_col, to_col_off,
+                     from_row, from_row_off, to_row, to_row_off):
+    center_x = (from_col + from_col_off / EMU_PER_CELL + to_col + to_col_off / EMU_PER_CELL) / 2
+    center_y = (from_row + from_row_off / EMU_PER_ROW + to_row + to_row_off / EMU_PER_ROW) / 2
+    return int(center_y), int(center_x)
 
 @app.route("/extract", methods=["POST"])
 def extract_images():
@@ -103,7 +76,7 @@ def extract_images():
         to_row = int(to_tag.find("a:row", ns).text)
         to_row_off = int(to_tag.find("a:rowOff", ns).text)
 
-        dominant_cell, ratio, coverage_map = calculate_cell_coverage(
+        center_row, center_col = get_center_cell(
             from_col, from_col_off, to_col, to_col_off,
             from_row, from_row_off, to_row, to_row_off
         )
@@ -120,12 +93,15 @@ def extract_images():
         if not os.path.exists(full_img_path):
             continue
 
-        if dominant_cell:
-            row_idx = dominant_cell[0] + 1
+        jan_value = f"unknown_{unknown_count}"
+        if center_row is not None:
+            row_idx = center_row + 1
             jan_cell = ws.cell(row=row_idx, column=jan_col_index + 1)
-            jan_value = str(jan_cell.value).strip() if jan_cell.value else f"row{row_idx}"
+            if jan_cell.value:
+                jan_value = str(jan_cell.value).strip()
+            else:
+                jan_value = f"row{row_idx}"
         else:
-            jan_value = f"unknown_{unknown_count}"
             unknown_count += 1
 
         with open(full_img_path, "rb") as f:
@@ -139,9 +115,7 @@ def extract_images():
 
         debug_log.append({
             "image": img_file,
-            "dominant_cell": dominant_cell,
-            "coverage_ratio": round(ratio, 3),
-            "cell_coverages": {str(k): round(v, 3) for k, v in coverage_map.items()},
+            "center_row_col": (center_row, center_col),
             "assigned_name": jan_value
         })
 
