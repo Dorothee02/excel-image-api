@@ -3,18 +3,19 @@ import zipfile
 import xml.etree.ElementTree as ET
 from io import BytesIO
 import openpyxl
+from openpyxl import load_workbook
 import os
 
 app = Flask(__name__)
 
-# 命名空間定義
+# XML 命名空間定義
 NAMESPACE_DEFS = {
     "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
     "r":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "a":   "http://schemas.openxmlformats.org/drawingml/2006/main"
 }
 
-# 1. 取得指定工作表的 drawing XML 路徑列表
+# 1. 取得指定工作表的 drawing 路徑
 def get_sheet_drawing_paths(zf, sheet_idx=1):
     rels_path = f"xl/worksheets/_rels/sheet{sheet_idx}.xml.rels"
     if rels_path not in zf.namelist():
@@ -28,18 +29,17 @@ def get_sheet_drawing_paths(zf, sheet_idx=1):
             drawing_files.append(path)
     return drawing_files
 
-# 2. 解析指定工作表圖片 anchor (row, col, rId)
+# 2. 解析指定工作表的 anchor (row, col, rId)
 def parse_sheet_anchors(xlsx_bytes, sheet_idx=1):
     zf = zipfile.ZipFile(BytesIO(xlsx_bytes))
     drawing_paths = get_sheet_drawing_paths(zf, sheet_idx)
     anchors = []
     for dr in drawing_paths:
-        xml = zf.read(dr)
-        tree = ET.fromstring(xml)
+        tree = ET.fromstring(zf.read(dr))
         for tag in ("oneCellAnchor", "twoCellAnchor", "absoluteAnchor"):
             for anc in tree.findall(f"xdr:{tag}", NAMESPACE_DEFS):
                 frm = anc.find("xdr:from", NAMESPACE_DEFS)
-                if frm is None:
+                if not frm:
                     continue
                 row = int(frm.find("xdr:row", NAMESPACE_DEFS).text) + 1
                 col = int(frm.find("xdr:col", NAMESPACE_DEFS).text) + 1
@@ -64,18 +64,17 @@ def build_media_map(zf):
                 media[rId] = media_path
     return media
 
-# 4. 讀取 workbook，建立 row -> JAN code 映射
+# 4. 建立 row -> JAN code 映射
 def load_jan_map(xlsx_bytes, jan_keyword="JAN"):
     wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), data_only=True)
     ws = wb.active
     jan_col = None
     header_row = None
     for r in range(1, 11):
-        values = [cell.value for cell in ws[r]]
-        for idx, val in enumerate(values, start=1):
+        vals = [cell.value for cell in ws[r]]
+        for idx, val in enumerate(vals, start=1):
             if val and jan_keyword.lower() in str(val).strip().lower():
-                jan_col = idx
-                header_row = r
+                jan_col, header_row = idx, r
                 break
         if jan_col:
             break
@@ -88,6 +87,20 @@ def load_jan_map(xlsx_bytes, jan_keyword="JAN"):
             jan_map[row] = str(code)
     return jan_map
 
+# 備援：使用 openpyxl 內建 ws._images
+def extract_with_openpyxl(xlsx_bytes, sheet_idx=1):
+    wb = load_workbook(BytesIO(xlsx_bytes), data_only=True)
+    ws = wb.worksheets[sheet_idx-1]
+    jan_map = load_jan_map(xlsx_bytes)
+    result = []
+    for img in ws._images:
+        row = img.anchor._from.row + 1
+        jan = jan_map.get(row) or f"unknown_{row}"
+        path = img.ref  # e.g. 'xl/media/image1.png'
+        ext = os.path.splitext(path)[1]
+        result.append(f"{jan}{ext}")
+    return result
+
 # 主處理函式
 @app.route("/extract-images", methods=["POST"])
 def extract_images():
@@ -96,26 +109,29 @@ def extract_images():
     if not f or not f.filename.endswith(".xlsx"):
         return "請上傳 .xlsx 檔案", 400
     data = f.read()
-    app.logger.info(f"Received file: {f.filename}, size={len(data)} bytes, sheet_idx={sheet_idx}")
+    app.logger.info(f"Received: {f.filename}, sheet={sheet_idx}, size={len(data)} bytes")
 
+    # 嘗試 ZIP+XML 解析
     anchors, zf = parse_sheet_anchors(data, sheet_idx)
     app.logger.info(f"Parsed anchors: {anchors}")
     jan_map = load_jan_map(data)
     media_map = build_media_map(zf)
-
-    # 建立最終檔名清單，保留原檔副檔名
-    extracted_files = []
+    extracted = []
     for row, col, rId in anchors:
         jan = jan_map.get(row) or f"unknown_{row}"
         img_path = media_map.get(rId)
         if img_path and img_path in zf.namelist():
-            ext = os.path.splitext(img_path)[1]  # 副檔名，例如 .png/.jpg
-            filename = f"{jan}{ext}"
-            extracted_files.append(filename)
-    app.logger.info(f"Extracted files: {extracted_files}")
-    return jsonify({"extracted": extracted_files})
+            ext = os.path.splitext(img_path)[1]
+            extracted.append(f"{jan}{ext}")
+    # 若無結果，fallback to openpyxl
+    if not extracted:
+        app.logger.info("No anchors found, falling back to openpyxl._images")
+        extracted = extract_with_openpyxl(data, sheet_idx)
+        app.logger.info(f"Fallback extracted: {extracted}")
 
-# alias route for convenience
+    return jsonify({"extracted": extracted})
+
+# 別名路由
 @app.route("/extract", methods=["POST"])
 def extract_images_alias():
     return extract_images()
