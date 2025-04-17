@@ -1,8 +1,45 @@
+
 from flask import Flask, request, jsonify
 import os, zipfile, tempfile, shutil, base64, xml.etree.ElementTree as ET
 from openpyxl import load_workbook
 
 app = Flask(__name__)
+
+EMU_PER_CELL = 9525 * 65  # 每欄約 65pt = 1 格寬
+EMU_PER_ROW = 9525 * 20   # 每列約 20pt = 1 格高
+
+def calculate_cell_coverage(from_col, from_col_off, to_col, to_col_off,
+                             from_row, from_row_off, to_row, to_row_off):
+    x1 = from_col + from_col_off / EMU_PER_CELL
+    x2 = to_col + to_col_off / EMU_PER_CELL
+    y1 = from_row + from_row_off / EMU_PER_ROW
+    y2 = to_row + to_row_off / EMU_PER_ROW
+
+    total_area = (x2 - x1) * (y2 - y1)
+    coverage_map = {}
+
+    for col in range(int(x1), int(x2) + 1):
+        for row in range(int(y1), int(y2) + 1):
+            cell_x1, cell_x2 = col, col + 1
+            cell_y1, cell_y2 = row, row + 1
+
+            overlap_x = max(0, min(x2, cell_x2) - max(x1, cell_x1))
+            overlap_y = max(0, min(y2, cell_y2) - max(y1, cell_y1))
+            overlap_area = overlap_x * overlap_y
+
+            if overlap_area > 0:
+                coverage_map[(row, col)] = overlap_area
+
+    if not coverage_map:
+        return None, 0.0
+
+    dominant_cell = max(coverage_map, key=coverage_map.get)
+    dominant_ratio = coverage_map[dominant_cell] / total_area
+
+    if dominant_ratio >= 0.6:
+        return dominant_cell, dominant_ratio
+    else:
+        return None, dominant_ratio
 
 @app.route("/extract", methods=["POST"])
 def extract_images():
@@ -22,26 +59,22 @@ def extract_images():
     wb = load_workbook(xlsx_path, data_only=True)
     ws = wb.active
 
-    # 🔍 尋找欄位名稱含 JAN / ＪＡＮ 的欄位
-    header_row = None
     jan_col_index = None
     for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10)):
         for j, cell in enumerate(row):
             if cell.value and isinstance(cell.value, str) and ("JAN" in cell.value.upper()):
-                header_row = i + 1
                 jan_col_index = j
                 break
         if jan_col_index is not None:
             break
     if jan_col_index is None:
-        return jsonify({"error": "找不到 JAN 或 ＪＡＮ 欄位"}), 400
+        return jsonify({"error": "找不到 JAN 欄位"}), 400
 
-    # 🔧 解析圖片與插入位置
     drawing_xml = os.path.join(unzip_path, "xl", "drawings", "drawing1.xml")
     rels_xml = os.path.join(unzip_path, "xl", "drawings", "_rels", "drawing1.xml.rels")
     media_path = os.path.join(unzip_path, "xl", "media")
-
     rels_map = {}
+
     if os.path.exists(rels_xml):
         rels_tree = ET.parse(rels_xml)
         for rel in rels_tree.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
@@ -49,41 +82,52 @@ def extract_images():
             target = rel.attrib['Target'].split('/')[-1]
             rels_map[rId] = target
 
-    image_info = []
-    if os.path.exists(drawing_xml):
-        tree = ET.parse(drawing_xml)
-        ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
-        for anchor in tree.findall(".//a:twoCellAnchor", ns):
-            from_row = int(anchor.find("a:from/a:row", ns).text)
-            to_row = int(anchor.find("a:to/a:row", ns).text)
-            center_row = round((from_row + to_row) / 2)
-
-            pic = anchor.find("a:pic", ns)
-            if pic is not None:
-                blip = pic.find(".//a:blip", {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"})
-                if blip is not None:
-                    embed = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-                    filename = rels_map.get(embed)
-                    image_info.append({"row": center_row, "filename": filename})
-
-    image_info = sorted(image_info, key=lambda x: x["row"])
+    tree = ET.parse(drawing_xml)
+    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
     output_images = []
     debug_log = []
+    unknown_count = 1
 
-    for info in image_info:
-        row_idx = info["row"] + 1  # openpyxl 是 1-based
-        img_file = info["filename"]
+    for anchor in tree.findall(".//a:twoCellAnchor", ns):
+        from_tag = anchor.find("a:from", ns)
+        to_tag = anchor.find("a:to", ns)
+        if from_tag is None or to_tag is None:
+            continue
+
+        from_col = int(from_tag.find("a:col", ns).text)
+        from_col_off = int(from_tag.find("a:colOff", ns).text)
+        from_row = int(from_tag.find("a:row", ns).text)
+        from_row_off = int(from_tag.find("a:rowOff", ns).text)
+
+        to_col = int(to_tag.find("a:col", ns).text)
+        to_col_off = int(to_tag.find("a:colOff", ns).text)
+        to_row = int(to_tag.find("a:row", ns).text)
+        to_row_off = int(to_tag.find("a:rowOff", ns).text)
+
+        dominant_cell, ratio = calculate_cell_coverage(
+            from_col, from_col_off, to_col, to_col_off,
+            from_row, from_row_off, to_row, to_row_off
+        )
+
+        pic = anchor.find("a:pic", ns)
+        if pic is None:
+            continue
+        blip = pic.find(".//a:blip", {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"})
+        if blip is None:
+            continue
+        embed = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+        img_file = rels_map.get(embed)
         full_img_path = os.path.join(media_path, img_file)
-
         if not os.path.exists(full_img_path):
             continue
 
-        jan_cell = ws.cell(row=row_idx, column=jan_col_index + 1)
-        cell_value = jan_cell.value
-        if cell_value is None:
-            jan_value = f"row{row_idx}"
+        if dominant_cell:
+            row_idx = dominant_cell[0] + 1
+            jan_cell = ws.cell(row=row_idx, column=jan_col_index + 1)
+            jan_value = str(jan_cell.value).strip() if jan_cell.value else f"row{row_idx}"
         else:
-            jan_value = str(cell_value).strip()
+            jan_value = f"unknown_{unknown_count}"
+            unknown_count += 1
 
         with open(full_img_path, "rb") as f:
             encoded = base64.b64encode(f.read()).decode("utf-8")
@@ -96,17 +140,13 @@ def extract_images():
 
         debug_log.append({
             "image": img_file,
-            "row": row_idx,
-            "jan_value": jan_value,
-            "cell_raw": str(cell_value)
+            "dominant_cell": dominant_cell,
+            "assigned_name": jan_value,
+            "coverage_ratio": round(ratio, 3)
         })
 
     shutil.rmtree(temp_dir)
-
-    return jsonify({
-        "images": output_images,
-        "debug": debug_log
-    })
+    return jsonify({"images": output_images, "debug": debug_log})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
