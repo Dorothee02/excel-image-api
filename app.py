@@ -36,9 +36,13 @@ def parse_sheet_anchors(xlsx_bytes, sheet_idx=1):
     for dr in drawing_paths:
         xml = zf.read(dr)
         tree = ET.fromstring(xml)
-        for tag in ("oneCellAnchor", "twoCellAnchor"):
+        # 支援 oneCellAnchor, twoCellAnchor, absoluteAnchor
+        for tag in ("oneCellAnchor", "twoCellAnchor", "absoluteAnchor"):
             for anc in tree.findall(f"xdr:{tag}", NAMESPACE_DEFS):
                 frm = anc.find("xdr:from", NAMESPACE_DEFS)
+                # 如果沒有 from，跳過
+                if frm is None:
+                    continue
                 row = int(frm.find("xdr:row", NAMESPACE_DEFS).text) + 1
                 col = int(frm.find("xdr:col", NAMESPACE_DEFS).text) + 1
                 blip = anc.find(".//a:blip", NAMESPACE_DEFS)
@@ -68,7 +72,6 @@ def load_jan_map(xlsx_bytes, jan_keyword="JAN"):
     ws = wb.active
     jan_col = None
     header_row = None
-    # 在前 10 列搜尋標題列
     for r in range(1, 11):
         values = [cell.value for cell in ws[r]]
         for idx, val in enumerate(values, start=1):
@@ -90,22 +93,18 @@ def load_jan_map(xlsx_bytes, jan_keyword="JAN"):
 # 主處理函式
 @app.route("/extract-images", methods=["POST"])
 def extract_images():
-    # 允許透過 query string 指定 sheet index，如 ?sheet=2
     sheet_idx = int(request.args.get('sheet', 1))
-
     f = request.files.get("file")
     if not f or not f.filename.endswith(".xlsx"):
         return "請上傳 .xlsx 檔案", 400
     data = f.read()
-    app.logger.info(f"Received file: {f.filename}, {len(data)} bytes, sheet_idx={sheet_idx}")
+    app.logger.info(f"Received file: {f.filename}, size={len(data)} bytes, sheet_idx={sheet_idx}")
 
-    # 解析
     anchors, zf = parse_sheet_anchors(data, sheet_idx)
     app.logger.info(f"Parsed anchors: {anchors}")
     jan_map = load_jan_map(data)
     media_map = build_media_map(zf)
 
-    # 匹配與回傳
     result = []
     for row, col, rId in anchors:
         jan = jan_map.get(row) or f"unknown_{row}"
@@ -120,5 +119,4 @@ def extract_images_alias():
     return extract_images()
 
 if __name__ == "__main__":
-    # 維持原本 8080 端口
     app.run(host="0.0.0.0", port=8080, debug=True)
