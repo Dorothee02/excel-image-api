@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import os, zipfile, tempfile, shutil, base64, xml.etree.ElementTree as ET
 from openpyxl import load_workbook
-import re
 
 app = Flask(__name__)
 
@@ -15,17 +14,15 @@ def extract_images():
     xlsx_path = os.path.join(temp_dir, "file.xlsx")
     file.save(xlsx_path)
 
-    # 解壓縮 Excel
     unzip_path = os.path.join(temp_dir, "unzipped")
     os.makedirs(unzip_path, exist_ok=True)
     with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
         zip_ref.extractall(unzip_path)
 
-    # 讀取 Excel 表格
     wb = load_workbook(xlsx_path, data_only=True)
     ws = wb.active
 
-    # 尋找欄位名稱中含 JAN / ＪＡＮ 的欄位索引
+    # 🔍 尋找欄位名稱含 JAN / ＪＡＮ 的欄位
     header_row = None
     jan_col_index = None
     for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10)):
@@ -36,19 +33,14 @@ def extract_images():
                 break
         if jan_col_index is not None:
             break
-
     if jan_col_index is None:
         return jsonify({"error": "找不到 JAN 或 ＪＡＮ 欄位"}), 400
 
-    # 讀取圖片插入位置
+    # 🔧 解析圖片與插入位置
     drawing_xml = os.path.join(unzip_path, "xl", "drawings", "drawing1.xml")
     rels_xml = os.path.join(unzip_path, "xl", "drawings", "_rels", "drawing1.xml.rels")
     media_path = os.path.join(unzip_path, "xl", "media")
 
-    if not os.path.exists(drawing_xml):
-        return jsonify({"error": "No drawing1.xml found"}), 400
-
-    # 解析 rels 對應圖片檔名
     rels_map = {}
     if os.path.exists(rels_xml):
         rels_tree = ET.parse(rels_xml)
@@ -57,37 +49,41 @@ def extract_images():
             target = rel.attrib['Target'].split('/')[-1]
             rels_map[rId] = target
 
-    # 取得圖片插入的 row index 與對應 rId
     image_info = []
-    tree = ET.parse(drawing_xml)
-    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
-    for anchor in tree.findall(".//a:twoCellAnchor", ns):
-        from_tag = anchor.find("a:from", ns)
-        if from_tag is not None:
-            row = int(from_tag.find("a:row", ns).text)
+    if os.path.exists(drawing_xml):
+        tree = ET.parse(drawing_xml)
+        ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"}
+        for anchor in tree.findall(".//a:twoCellAnchor", ns):
+            from_row = int(anchor.find("a:from/a:row", ns).text)
+            to_row = int(anchor.find("a:to/a:row", ns).text)
+            center_row = round((from_row + to_row) / 2)
+
             pic = anchor.find("a:pic", ns)
             if pic is not None:
                 blip = pic.find(".//a:blip", {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"})
                 if blip is not None:
                     embed = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
                     filename = rels_map.get(embed)
-                    image_info.append({"row": row, "filename": filename})
+                    image_info.append({"row": center_row, "filename": filename})
 
-    # 依 row 排序圖片位置
     image_info = sorted(image_info, key=lambda x: x["row"])
-
-    # 匯出圖片 + 命名（對應該 row 的 jan_col）
     output_images = []
+    debug_log = []
+
     for info in image_info:
-        row_idx = info["row"] + 1  # openpyxl 是從 1 開始
+        row_idx = info["row"] + 1  # openpyxl 是 1-based
         img_file = info["filename"]
         full_img_path = os.path.join(media_path, img_file)
+
         if not os.path.exists(full_img_path):
             continue
 
-        # 嘗試讀取該 row 的 jan 值
-        jan_cell = ws.cell(row=row_idx + 1, column=jan_col_index + 1)
-        jan_value = str(jan_cell.value).strip() if jan_cell.value else f"row{row_idx}"
+        jan_cell = ws.cell(row=row_idx, column=jan_col_index + 1)
+        cell_value = jan_cell.value
+        if cell_value is None:
+            jan_value = f"row{row_idx}"
+        else:
+            jan_value = str(cell_value).strip()
 
         with open(full_img_path, "rb") as f:
             encoded = base64.b64encode(f.read()).decode("utf-8")
@@ -98,8 +94,19 @@ def extract_images():
             "mime_type": "image/jpeg"
         })
 
+        debug_log.append({
+            "image": img_file,
+            "row": row_idx,
+            "jan_value": jan_value,
+            "cell_raw": str(cell_value)
+        })
+
     shutil.rmtree(temp_dir)
-    return jsonify({"images": output_images})
+
+    return jsonify({
+        "images": output_images,
+        "debug": debug_log
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
