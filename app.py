@@ -3,8 +3,17 @@ import zipfile
 import os
 import tempfile
 import xml.etree.ElementTree as ET
+import base64
 
 app = Flask(__name__)
+
+# 🧠 升級：支援 A ~ ZZ 甚至 AAA 欄位命名
+def col_index_to_letter(index):
+    letters = ''
+    while index >= 0:
+        letters = chr(index % 26 + ord('A')) + letters
+        index = index // 26 - 1
+    return letters
 
 @app.route('/upload', methods=['POST'])
 def upload_excel():
@@ -23,57 +32,43 @@ def upload_excel():
         except zipfile.BadZipFile:
             return jsonify({"error": "Invalid Excel file"}), 400
 
-        # 路徑定義
         drawing_path = os.path.join(tmpdir, "xl/drawings/drawing1.xml")
-        rels_path = os.path.join(tmpdir, "xl/drawings/_rels/drawing1.xml.rels")
         media_path = os.path.join(tmpdir, "xl/media")
         worksheet_dir = os.path.join(tmpdir, "xl/worksheets")
 
         result = {
+            "cell_image_map": {},
             "drawing1.xml exists": os.path.exists(drawing_path),
             "media folder exists": os.path.exists(media_path),
-            "rels exists": os.path.exists(rels_path),
-            "worksheet found": False,
-            "cell_image_map": {}  # 最終目標對照表
+            "worksheet found": False
         }
 
-        # 嘗試抓出一個 worksheet 名稱（非必要）
         if os.path.exists(worksheet_dir):
             for fname in os.listdir(worksheet_dir):
                 if fname.endswith(".xml"):
                     result["worksheet found"] = True
                     break
 
-        # 準備讀 rels → rId 對應的圖片檔名
-        rid_to_img = {}
-        if os.path.exists(rels_path):
-            tree = ET.parse(rels_path)
-            root = tree.getroot()
-            for rel in root:
-                rid = rel.attrib.get("Id")
-                target = rel.attrib.get("Target")  # 通常像 ../media/image4.png
-                if rid and target and "media/" in target:
-                    img_name = os.path.basename(target)
-                    rid_to_img[rid] = img_name
+        # 🔍 收集圖片清單（按檔名排序）
+        image_files = sorted(
+            [f for f in os.listdir(media_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        ) if os.path.exists(media_path) else []
 
-        # 開始讀 drawing1.xml
+        # 📍 抓出圖片插入位置並用儲存格名稱命名
         if os.path.exists(drawing_path):
+            ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'}
             tree = ET.parse(drawing_path)
             root = tree.getroot()
-            ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'}
 
-            cell_image_map = {}
+            image_map = {}
+            image_index = 0
 
             for anchor in root.findall('a:twoCellAnchor', ns):
                 from_elem = anchor.find('a:from', ns)
                 to_elem = anchor.find('a:to', ns)
-                pic_elem = anchor.find('a:pic', ns)
-
-                # 沒有圖片或位置資訊就略過
-                if from_elem is None or to_elem is None or pic_elem is None:
+                if from_elem is None or to_elem is None:
                     continue
 
-                # 算中心點 row、col
                 row_start = int(from_elem.find('a:row', ns).text)
                 row_end = int(to_elem.find('a:row', ns).text)
                 row_center = round((row_start + row_end) / 2)
@@ -82,23 +77,23 @@ def upload_excel():
                 col_end = int(to_elem.find('a:col', ns).text)
                 col_center = round((col_start + col_end) / 2)
 
-                col_letter = chr(ord('A') + col_center)
-                cell_ref = f"{col_letter}{row_center + 1}"  # row 從 0 開始
+                col_letter = col_index_to_letter(col_center)
+                cell_ref = f"{col_letter}{row_center + 1}"
 
-                # 取得 r:embed → 轉成圖片名稱
-                blip = pic_elem.find(".//a:blip", ns)
-                if blip is None:
-                    continue
+                # 🖼️ 對應圖片順序 → base64 + 附副檔名
+                if image_index < len(image_files):
+                    image_path = os.path.join(media_path, image_files[image_index])
+                    with open(image_path, "rb") as img_file:
+                        img_data = img_file.read()
+                        ext = os.path.splitext(image_files[image_index])[-1].replace('.', '')
+                        base64_img = f"data:image/{ext};base64," + base64.b64encode(img_data).decode('utf-8')
+                        image_map[cell_ref] = base64_img
+                    image_index += 1
 
-                rId = blip.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
-                image_filename = rid_to_img.get(rId, f"unknown_{rId}.png")
-
-                cell_image_map[cell_ref] = image_filename
-
-            result["cell_image_map"] = cell_image_map
+            result["cell_image_map"] = image_map
 
         return jsonify(result)
 
-# Zeabur port 設定
+# 🌐 Zeabur 要用 port 8080
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
