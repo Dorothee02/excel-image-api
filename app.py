@@ -1,14 +1,33 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 import os
 import tempfile
 import zipfile
 from lxml import etree
 import shutil
-import openpyxl
-from PIL import Image
-import io
+import re
 
 app = Flask(__name__)
+
+def find_cell_reference_in_worksheet(worksheet_path, image_names):
+    """分析工作表 XML 尋找圖片引用"""
+    try:
+        with open(worksheet_path, 'rb') as f:
+            content = f.read().decode('utf-8', errors='ignore')
+            
+        # 尋找例如 <drawing r:id="rId1"/> 的標籤
+        drawing_refs = re.findall(r'<drawing r:id="(rId\d+)"/>', content)
+        if not drawing_refs:
+            return None
+            
+        # 尋找儲存格位置標記
+        cell_positions = re.findall(r'<c r="([A-Z]+\d+)"', content)
+        
+        # 分析內容尋找圖片和儲存格的關聯
+        # 這部分可能需要根據實際 XML 結構調整
+        return cell_positions
+    except Exception as e:
+        print(f"Error analyzing worksheet: {str(e)}")
+        return None
 
 @app.route('/upload', methods=['POST'])
 def upload_excel():
@@ -23,122 +42,128 @@ def upload_excel():
         output_dir = os.path.join(tmpdir, "output_images")
         os.makedirs(output_dir, exist_ok=True)
         
-        # 同時使用多種方法提取圖片
-        extracted_images = []
-        file_structure = []
-        
-        # 方法1: 使用 zipfile 直接提取媒體文件
         try:
             with zipfile.ZipFile(filepath, 'r') as zip_ref:
-                # 獲取文件結構以便調試
-                file_structure = zip_ref.namelist()
                 zip_ref.extractall(tmpdir)
+                file_list = zip_ref.namelist()
                 
-                # 查找媒體文件
-                media_folder = os.path.join(tmpdir, "xl/media")
-                if os.path.exists(media_folder):
-                    for idx, media_file in enumerate(os.listdir(media_folder)):
-                        media_path = os.path.join(media_folder, media_file)
-                        output_path = os.path.join(output_dir, f"img_{idx+1}_{media_file}")
-                        shutil.copy2(media_path, output_path)
-                        
-                        extracted_images.append({
-                            "method": "direct_extraction",
-                            "id": idx + 1,
-                            "original_name": media_file,
-                            "saved_as": f"img_{idx+1}_{media_file}"
-                        })
-        except Exception as e:
-            print(f"Direct extraction error: {str(e)}")
-        
-        # 方法2: 使用 openpyxl 嘗試獲取圖片位置
-        try:
-            wb = openpyxl.load_workbook(filepath)
-            for sheet_name in wb.sheetnames:
-                sheet = wb[sheet_name]
-                if hasattr(sheet, '_images'):
-                    for idx, img in enumerate(sheet._images):
-                        try:
-                            img_data = img._data()
-                            cell_ref = "unknown"
-                            
-                            if hasattr(img, 'anchor'):
-                                anchor = img.anchor
-                                if hasattr(anchor, '_from'):
-                                    col = anchor._from.col
-                                    row = anchor._from.row
-                                    cell_ref = f"{chr(65 + col)}{row + 1}"
-                            
-                            # 保存圖片
-                            img_filename = f"{sheet_name}_{cell_ref}_{idx}.png"
-                            img_path = os.path.join(output_dir, img_filename)
-                            
-                            with open(img_path, 'wb') as f:
-                                f.write(img_data)
-                            
-                            # 查看是否已經有相同圖片被提取
-                            duplicate = False
-                            for existing in extracted_images:
-                                if existing.get("cell_ref") == cell_ref and existing.get("sheet") == sheet_name:
-                                    duplicate = True
-                                    break
-                            
-                            if not duplicate:
-                                extracted_images.append({
-                                    "method": "openpyxl",
-                                    "sheet": sheet_name,
-                                    "cell_ref": cell_ref,
-                                    "saved_as": img_filename
-                                })
-                        except Exception as e:
-                            print(f"Error extracting image with openpyxl: {str(e)}")
-        except Exception as e:
-            print(f"Openpyxl error: {str(e)}")
-        
-        # 方法3: 分析工作表中的關係文件
-        try:
+            # 步驟1: 找出所有工作表
+            worksheet_files = []
+            worksheet_folder = os.path.join(tmpdir, "xl/worksheets")
+            if os.path.exists(worksheet_folder):
+                worksheet_files = [f for f in os.listdir(worksheet_folder) if f.endswith('.xml')]
+            
+            # 步驟2: 提取媒體文件
+            media_folder = os.path.join(tmpdir, "xl/media")
+            extracted_images = []
+            media_files = []
+            
+            if os.path.exists(media_folder):
+                media_files = os.listdir(media_folder)
+                for idx, media_file in enumerate(media_files):
+                    media_path = os.path.join(media_folder, media_file)
+                    output_path = os.path.join(output_dir, f"img_{idx+1}_{media_file}")
+                    shutil.copy2(media_path, output_path)
+                    
+                    # 初始化圖片信息
+                    image_info = {
+                        "id": idx + 1,
+                        "method": "direct_extraction",
+                        "original_name": media_file,
+                        "saved_as": f"img_{idx+1}_{media_file}"
+                    }
+                    extracted_images.append(image_info)
+            
+            # 步驟3: 高級定位 - 分析各工作表 XML
+            for ws_file in worksheet_files:
+                ws_path = os.path.join(worksheet_folder, ws_file)
+                
+                # 分析工作表 XML 尋找圖片引用
+                cell_refs = find_cell_reference_in_worksheet(ws_path, media_files)
+                if cell_refs:
+                    print(f"Found potential cell references in {ws_file}: {cell_refs[:5]}...")
+            
+            # 步驟4: 嘗試通過關係文件定位
             rels_folder = os.path.join(tmpdir, "xl/worksheets/_rels")
             if os.path.exists(rels_folder):
                 for rels_file in os.listdir(rels_folder):
                     if rels_file.endswith(".xml.rels"):
-                        sheet_name = rels_file.split(".")[0]
-                        rels_path = os.path.join(rels_folder, rels_file)
-                        
-                        with open(rels_path, "rb") as f:
-                            tree = etree.parse(f)
-                            root = tree.getroot()
-                            ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+                        try:
+                            rels_path = os.path.join(rels_folder, rels_file)
+                            sheet_name = rels_file.split(".")[0]
                             
-                            for rel in root.findall(".//r:Relationship", namespaces=ns):
-                                target = rel.get("Target")
-                                if target and "../drawings/" in target:
-                                    drawing_file = target.split("/")[-1]
-                                    print(f"Found drawing reference: {sheet_name} -> {drawing_file}")
-        except Exception as e:
-            print(f"Relationship analysis error: {str(e)}")
-        
-        # 創建結果 ZIP 檔案
-        if extracted_images:
+                            with open(rels_path, "rb") as f:
+                                tree = etree.parse(f)
+                                root = tree.getroot()
+                                ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+                                
+                                for rel in root.findall(".//r:Relationship", namespaces=ns):
+                                    rel_id = rel.get("Id")
+                                    target = rel.get("Target")
+                                    rel_type = rel.get("Type")
+                                    
+                                    # 檢查是否為與繪圖相關的關係
+                                    if "drawing" in target.lower():
+                                        print(f"Drawing relationship found: {sheet_name} -> {rel_id} -> {target}")
+                                        
+                                        # 嘗試找到對應的工作表XML
+                                        sheet_xml_path = os.path.join(worksheet_folder, f"{sheet_name}.xml")
+                                        if os.path.exists(sheet_xml_path):
+                                            with open(sheet_xml_path, "rb") as sheet_file:
+                                                sheet_content = sheet_file.read().decode('utf-8', errors='ignore')
+                                                # 尋找使用此關係ID的位置
+                                                draw_tag = f'<drawing r:id="{rel_id}"/>'
+                                                if draw_tag in sheet_content:
+                                                    # 分析附近的標籤找出儲存格位置
+                                                    cell_tags = re.findall(r'<c r="([A-Z]+\d+)"[^>]*>(?:.*?)</c>', 
+                                                                          sheet_content, re.DOTALL)
+                                                    if cell_tags:
+                                                        print(f"Possible cell references: {cell_tags[:5]}")
+                        except Exception as e:
+                            print(f"Error analyzing relationship file {rels_file}: {e}")
+            
+            # 步驟5: 嘗試從content_types.xml獲取更多信息
+            content_types_path = os.path.join(tmpdir, "[Content_Types].xml")
+            if os.path.exists(content_types_path):
+                try:
+                    with open(content_types_path, "rb") as f:
+                        tree = etree.parse(f)
+                        root = tree.getroot()
+                        
+                        # 尋找與圖片相關的內容類型
+                        for override in root.findall(".//{http://schemas.openxmlformats.org/package/2006/content-types}Override"):
+                            part_name = override.get("PartName")
+                            content_type = override.get("ContentType")
+                            
+                            if "drawing" in part_name.lower():
+                                print(f"Drawing content found: {part_name} -> {content_type}")
+                except Exception as e:
+                    print(f"Error analyzing content types: {e}")
+            
+            # 創建 ZIP 檔案來傳送所有提取的圖片
             zip_output = os.path.join(tmpdir, "extracted_images.zip")
             with zipfile.ZipFile(zip_output, 'w') as zipf:
                 for img_info in extracted_images:
-                    img_filename = img_info.get("saved_as")
-                    img_path = os.path.join(output_dir, img_filename)
-                    if os.path.exists(img_path):
-                        zipf.write(img_path, arcname=img_filename)
+                    img_path = os.path.join(output_dir, img_info["saved_as"])
+                    zipf.write(img_path, arcname=img_info["saved_as"])
             
+            # 返回結果
             return jsonify({
                 "status": "success",
                 "message": "Images extracted successfully",
                 "extracted_count": len(extracted_images),
-                "images": extracted_images
+                "images": extracted_images,
+                "file_structure": [f for f in file_list if f.startswith("xl/") and not f.endswith("/")][:20]
             })
-        else:
+            
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
             return jsonify({
-                "status": "error",
-                "message": "No images found in the Excel file",
-                "file_structure": file_structure[:100]
-            }), 404
+                "error": str(e),
+                "details": error_details,
+                "file_structure": file_list[:50] if 'file_list' in locals() else []
+            }), 500
 
 @app.route('/test', methods=['GET'])
 def test():
