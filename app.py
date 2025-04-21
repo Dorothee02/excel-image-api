@@ -4,7 +4,7 @@ import tempfile
 import zipfile
 from lxml import etree
 import shutil
-import glob
+import json
 
 app = Flask(__name__)
 
@@ -33,22 +33,66 @@ def upload_excel():
         try:
             with zipfile.ZipFile(filepath, 'r') as zip_ref:
                 zip_ref.extractall(tmpdir)
+                # 獲取 ZIP 內容列表，用於調試
+                file_list = zip_ref.namelist()
         except zipfile.BadZipFile:
             return jsonify({"error": "Invalid Excel file"}), 400
         
-        # 檢查檔案是否存在
-        drawing_folder = os.path.join(tmpdir, "xl/drawings")
+        # 檢查 media 文件夾
         media_folder = os.path.join(tmpdir, "xl/media")
-        
-        drawing_exists = os.path.exists(drawing_folder)
         media_exists = os.path.exists(media_folder)
+        media_files = []
+        if media_exists:
+            media_files = os.listdir(media_folder)
         
+        # 更廣泛地檢查 drawings 文件夾內容
+        drawing_folder = os.path.join(tmpdir, "xl/drawings")
+        drawing_exists = os.path.exists(drawing_folder)
+        drawing_files = []
+        if drawing_exists:
+            drawing_files = os.listdir(drawing_folder)
+        
+        # 如果沒有找到 drawing 文件但有 media 文件，我們嘗試直接處理
+        if not drawing_exists and media_exists and media_files:
+            # 提取所有媒體文件
+            extracted_files = []
+            for idx, media_file in enumerate(media_files):
+                media_path = os.path.join(media_folder, media_file)
+                output_path = os.path.join(output_dir, f"unknown_{idx+1}_{media_file}")
+                shutil.copy2(media_path, output_path)
+                
+                extracted_files.append({
+                    "file": media_file,
+                    "position": f"unknown_{idx+1}",  # 位置未知，使用索引
+                    "saved_as": f"unknown_{idx+1}_{media_file}",
+                    "status": "extracted_without_position"
+                })
+            
+            # 創建ZIP壓縮包保存提取的圖片
+            zip_output = os.path.join(tmpdir, "extracted_images.zip")
+            with zipfile.ZipFile(zip_output, 'w') as zipf:
+                for img_info in extracted_files:
+                    source_path = os.path.join(output_dir, img_info["saved_as"])
+                    zipf.write(source_path, arcname=img_info["saved_as"])
+            
+            return jsonify({
+                "status": "partial_success",
+                "message": "Found media files but could not determine their positions",
+                "drawing_exists": drawing_exists,
+                "media_exists": media_exists,
+                "media_files": media_files,
+                "extracted_files": extracted_files,
+                "file_structure": file_list[:100]  # 返回部分文件結構，用於調試
+            })
+        
+        # 如果沒有 drawing 和 media，返回錯誤
         if not drawing_exists or not media_exists:
             return jsonify({
                 "status": "error",
                 "message": "Excel file does not contain embedded images",
                 "drawing_exists": drawing_exists,
-                "media_exists": media_exists
+                "media_exists": media_exists,
+                "file_structure": file_list[:100] if 'file_list' in locals() else []
             }), 400
         
         # 讀取關係文件，建立映射
@@ -115,7 +159,7 @@ def upload_excel():
                                                     "saved_as": f"{cell_ref}_{image_filename}"
                                                 })
                                 except Exception as e:
-                                    print(f"Error processing anchor: {e}")
+                                    print(f"Error processing twoCellAnchor: {e}")
                             
                             # 處理 oneCellAnchor
                             for anchor in root.findall(".//xdr:oneCellAnchor", namespaces=ns):
@@ -143,7 +187,7 @@ def upload_excel():
                                                     "saved_as": f"{cell_ref}_{image_filename}"
                                                 })
                                 except Exception as e:
-                                    print(f"Error processing anchor: {e}")
+                                    print(f"Error processing oneCellAnchor: {e}")
                     except Exception as e:
                         print(f"Failed to parse {fname}: {e}")
         
@@ -160,6 +204,11 @@ def upload_excel():
             "extracted_images": extracted_images,
             "cell_image_map": image_cell_map
         })
+
+# 添加用於偵錯的端點
+@app.route('/test', methods=['GET'])
+def test():
+    return jsonify({"status": "API is running"})
 
 # 執行於 Zeabur 時固定用 port 8080
 if __name__ == '__main__':
