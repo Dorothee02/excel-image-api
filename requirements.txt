@@ -1,6 +1,5 @@
 Flask==2.2.5
-openpyxl==3.1.2
-lxml
 gunicorn==23.0.0
-Pillow
-pandas
+pandas==1.5.3
+openpyxl==3.1.2
+lxml==4.9.3
