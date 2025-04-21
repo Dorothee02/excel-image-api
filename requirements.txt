@@ -3,3 +3,4 @@ openpyxl==3.1.2
 lxml
 gunicorn==23.0.0
 Pillow
+pandas
