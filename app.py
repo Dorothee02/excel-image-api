@@ -6,6 +6,7 @@ import shutil
 import pandas as pd
 import openpyxl
 import xml.etree.ElementTree as ET
+import base64
 from openpyxl.utils import get_column_letter
 from openpyxl import load_workbook
 
@@ -197,6 +198,45 @@ def upload_excel():
                 "jan_column_found": f"Column {openpyxl.utils.get_column_letter(jan_column)} (Header at row {jan_header_row})",
                 "extracted_images": extracted_images
             })
+@app.route('/upload_base64', methods=['POST'])
+def upload_excel_base64():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    
+    file = request.files['file']
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tmpdir = os.path.join(temp_dir, 'temp')
+        output_dir = os.path.join(temp_dir, 'output')
+        os.makedirs(tmpdir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        filepath = os.path.join(tmpdir, file.filename)
+        file.save(filepath)
+        
+        jan_column, jan_header_row, extracted_images, _ = proceed(filepath, output_dir, tmpdir)
+        
+        if not jan_column:
+            return jsonify({"error": "Could not find JAN column in the Excel file"}), 400
+        
+        base64_results = []
+        
+        for img_info in extracted_images:
+            saved_file = img_info["saved_as"]
+            img_path = os.path.join(output_dir, saved_file)
+
+            if os.path.exists(img_path):
+                with open(img_path, "rb") as image_file:
+                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                    prefix = saved_file.split('_')[0]
+                    ext = os.path.splitext(saved_file)[1]
+                    clean_name = prefix + ext
+                    base64_results.append({
+                        "file_name": clean_name,
+                        "base64": encoded_string
+                    })
+
+        return jsonify(base64_results)
 
 @app.route('/test', methods=['GET'])
 def test():
