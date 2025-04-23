@@ -30,10 +30,11 @@ def obtainJanValueColumnIdx(wb):
         for row_idx in range(1, min(20, sheet.max_row + 1)):  # 搜尋前20行
             for col_idx in range(1, min(20, sheet.max_column + 1)):  # 搜尋前20列
                 cell_value = sheet.cell(row=row_idx, column=col_idx).value
-                if cell_value and isinstance(cell_value, str) and "JAN" in cell_value:
-                    jan_column = col_idx
-                    jan_header_row = row_idx
-                    break
+                if cell_value and isinstance(cell_value, str):
+                    if "JAN" in cell_value or "ＪＡＮ" in cell_value:
+                        jan_column = col_idx
+                        jan_header_row = row_idx
+                        break
             if jan_column:
                 break
         if jan_column:
