@@ -55,34 +55,58 @@ def map_images_to_cells(xlsx_path, jan_column):
             rels_xml = ET.fromstring(zf.read(rels_path))
 
             alist = rels_xml.findall('rel:Relationship', ns)
+            drawing_target = None
             for rel in alist:
-                if rel.attrib.get('Type','').endswith('/drawing'):
+                if rel.attrib.get('Type', '').endswith('/drawing'):
                     drawing_target = rel.attrib['Target']
-                    drawing_path = 'xl/' + drawing_target.replace('../','')
                     break
-            else:
+            if not drawing_target:
                 continue
+
+            drawing_path = 'xl/' + drawing_target.replace('../', '')
+            if drawing_path not in all_files:
+                continue  # 防呆：有可能找不到這個 drawing path
 
             drawing_xml = ET.fromstring(zf.read(drawing_path))
             drawing_rels = f'xl/drawings/_rels/{drawing_path.split("/")[-1]}.rels'
+            if drawing_rels not in all_files:
+                continue  # 防呆：有可能找不到 rels 檔案
+
             rels2_xml = ET.fromstring(zf.read(drawing_rels))
 
             blist = rels2_xml.findall('rel:Relationship', ns)
             rid2media = {
-                r.attrib['Id']: 'xl/' + r.attrib['Target'].replace('../','')
+                r.attrib['Id']: 'xl/' + r.attrib['Target'].replace('../', '')
                 for r in blist
             }
 
             for anchor in drawing_xml.findall('.//xdr:twoCellAnchor', NS) + drawing_xml.findall('.//xdr:oneCellAnchor', NS):
                 frm = anchor.find('xdr:from', NS)
-                row = int(frm.find('xdr:row', NS).text) + 1
-                col = int(frm.find('xdr:col', NS).text) + 1
+                if frm is None:
+                    continue  # 防呆：找不到 from 就跳過
+
+                row_el = frm.find('xdr:row', NS)
+                col_el = frm.find('xdr:col', NS)
+                if row_el is None or col_el is None:
+                    continue  # 防呆：row 或 col 缺失
+
+                try:
+                    row = int(row_el.text) + 1
+                    col = int(col_el.text) + 1
+                except (ValueError, TypeError):
+                    continue  # 防呆：row/col值無法轉成整數
+
                 cell = get_column_letter(col) + str(row)
 
                 blip = anchor.find('.//a:blip', NS)
-                rId  = blip.attrib[f'{{{NS["r"]}}}embed']
-                media_file = rid2media.get(rId)
+                if blip is None:
+                    continue  # 防呆：沒有圖片資訊
 
+                rId = blip.attrib.get(f'{{{NS["r"]}}}embed')
+                if not rId:
+                    continue  # 防呆：沒有 embed 屬性
+
+                media_file = rid2media.get(rId)
                 jan = sheet.cell(row=row, column=jan_column).value
 
                 results.append({
@@ -92,7 +116,7 @@ def map_images_to_cells(xlsx_path, jan_column):
                     'col':       col,
                     'jan_value': jan or f'unknown_row{row}',
                     'media':     media_file,
-                    'media_name': os.path.basename(media_file)
+                    'media_name': os.path.basename(media_file) if media_file else None
                 })
 
     return results
